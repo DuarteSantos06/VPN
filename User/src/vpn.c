@@ -13,6 +13,9 @@
 #include <sys/socket.h>
 #include <sys/types.h>
 
+
+#include <sys/select.h>
+
 /* includes from my project */
 #include "../../Server/include/server.h"
 
@@ -33,7 +36,7 @@ int alloc_tun() {
     }
 
     memset(&ifr,0, sizeof(ifr));
-    ifr.ifr_flags= IFF_TUN;
+    ifr.ifr_flags= IFF_TUN| IFF_NO_PI;
     strncpy(ifr.ifr_name, devname, IFNAMSIZ);
 
     /*
@@ -98,7 +101,22 @@ int read_from_tun(int tun_fdf, char *buffer, size_t max_size_buffer )
 
 
 /*
- * This function writes to the server the content that is in the buffer passed as a parameter
+ * This function sends to the tun the content in the buffer
+ * Returns the number of bytes written or -1 in case off an error                                                 
+ */
+int send_to_tun(int tun_fdf, char *buffer, size_t max_size_buffer )
+{
+    int bytes_written;
+    if((bytes_written = write(tun_fdf, buffer, max_size_buffer)) < 0) {
+        perror("Writing to tun:");
+        return -1;
+    }
+    return bytes_written;
+}
+
+
+/*
+ * This function sends to the server the content that is in the buffer passed as a parameter
  * returns the number of bytes sent or -1 in case of an error
 */
 int send_to_server(int client_socket_fd, struct sockaddr_in *server_address, char *buffer,size_t buffer_len )
@@ -130,6 +148,67 @@ int read_from_server(int client_socket_fd, struct sockaddr_in *server_address, c
 }
 
 
+/*
+ * Main loop function, handles the select and the read/write from tun and server
+ * receives the tun_fd, the client_socket_fd and the server_address as parameters
+ * returns nothing
+*/
+void main_loop(int tun_fd,int client_socket_fd, struct sockaddr_in *server_address)
+{
+    char buffer[MAX_SIZE_BUFF];
+    fd_set readfds;
+    int max_fd = (tun_fd > client_socket_fd) ? tun_fd : client_socket_fd;
+    while(1)
+    {
+        FD_ZERO(&readfds);
+        FD_SET(tun_fd, &readfds);
+        FD_SET(client_socket_fd, &readfds);
+
+        if(select(max_fd + 1, &readfds, NULL, NULL, NULL) < 0) {
+            perror("select:");
+            continue;
+        }
+
+        /* Read from the tun, and then send it to the server*/
+        if(FD_ISSET(tun_fd,&readfds))
+        {
+            int bytes_read,bytes_sent;
+            if((bytes_read=read_from_tun(tun_fd,buffer,MAX_SIZE_BUFF))<0)
+            {
+                continue;
+            }
+            if((bytes_sent=send_to_server(client_socket_fd,server_address,buffer,bytes_read))<0)
+            {
+                continue;
+            }
+            /* Debug print*/
+            printf("[TUN -> SERVER] %d bytes lidos do TUN, %d bytes enviados para %s:%d\n",
+                bytes_read, bytes_sent,
+                inet_ntoa(server_address->sin_addr), ntohs(server_address->sin_port));
+
+        }
+        /* Read from server and send it in the tun */
+        else if(FD_ISSET(client_socket_fd,&readfds))
+        {
+            int bytes_read, bytes_sent;
+            if((bytes_read=read_from_server(client_socket_fd,server_address,buffer,MAX_SIZE_BUFF))<0)
+            {
+                continue;
+            }
+            if((bytes_sent=send_to_tun(tun_fd,buffer,bytes_read))<0)
+            {
+                continue;
+            }
+            /* debug print */
+            printf("[SERVER -> TUN] %d bytes lidos do servidor, %d bytes escritos no TUN\n",
+                bytes_read, bytes_sent);
+        }
+    }
+
+
+
+
+}
 
 
 int main() {
@@ -152,10 +231,8 @@ int main() {
         return -1;
     }
 
-    while(1)
-    {
-        /* Main loop */
-    }
+    /* Main loop */
+    main_loop(tun_fd,client_socket_fd,&server_address);
   
     close(tun_fd);
     close(client_socket_fd);
