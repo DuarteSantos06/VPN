@@ -9,6 +9,7 @@ static const unsigned char VPN_KEY[32] = {
     0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00
 };
 
+
 // Tamanhos da cifra (baseado na libsodium)
 #define NONCE_LEN 24  // Para XChaCha20
 #define TAG_LEN 16

@@ -6,6 +6,7 @@
 #include <unistd.h>     /* read(), close() */
 #include <netinet/in.h> /* struct sockaddr_in, INADDR_ANY, htons() */
 #include <arpa/inet.h>  /* inet_ntoa() */
+#include <netinet/ip.h>
 
 /* includes for struct ifreq, etc */
 #include <linux/if.h>
@@ -15,7 +16,67 @@
 /* includes from my project */
 #include "server.h"
 
+#define MSG_HANDSHAKE_REQ 1
+#define MSG_HANDSHAKE_ACK 2
+#define MSG_DATA 3
 
+typedef struct {
+    uint8_t type;          // Tipo de mensagem (Handshake ou Dados)
+    uint32_t virtual_ip;   // O IP virtual do cliente (útil no handshake)
+    // No futuro podes adicionar aqui: uint32_t seq_number, etc.
+} vpn_header_t;
+
+
+struct client_table clients[MAX_CLIENTS];
+
+/*
+ * This functions looks for the client in our table, if it finds the client returns the position
+ * if it does not find returns -1
+*/
+int find_client(struct sockaddr_in *client_address)
+{
+    for (int i = 0; i < MAX_CLIENTS; i++)
+    {
+        if (clients[i].known && clients[i].client_address.sin_addr.s_addr == client_address->sin_addr.s_addr && clients[i].client_address.sin_port == client_address->sin_port)
+        {
+            return i;
+        }
+    }
+    return -1;
+}
+
+/*
+ * This function adds a client to our table, if the table is already full returns -1 
+*/
+int add_client(struct sockaddr_in *client_address)
+{
+    for(int i = 0 ; i < MAX_CLIENTS ; i ++)
+    {
+        if( clients[i].known==0)
+        {
+            memset(&clients[i], 0, sizeof(client_table));
+            clients[i].client_address = *client_address;
+            clients[i].known = 1;
+            clients[i].last_seen = time(NULL);
+            return i;
+        }
+    }
+    return -1;
+}
+
+/*
+ * This function cleans the table, it "removes" the clients who didn't send anything in the las 30 seconds
+*/
+void clean_table()
+{
+    for(int i = 0 ; i< MAX_CLIENTS ; i++)
+    {
+        if(clients[i].known && (time(NULL)-clients[i].last_seen)>30)
+        {
+            memset(&clients[i],0,sizeof(clients[i]));
+        }
+    }
+}
 
 
 /*
@@ -91,6 +152,13 @@ int read_from_client(int server_socket_fd, struct sockaddr_in *client_address, c
         perror("recvfrom:");
         return -1;
     }
+
+    int idx = find_client(client_address);
+    if (idx == -1) {
+        add_client(client_address);
+    } else {
+        clients[idx].last_seen = time(NULL);  
+    }
     return bytes_read;
 }
 
@@ -145,13 +213,16 @@ int send_to_the_client(int server_socket_fd, struct sockaddr_in *client_address,
  * receives the tun_fd, the server_socket_fd and the client_address as parameters
  * returns nothing
 */
-void main_loop(int tun_fd, int server_socket_fd,struct sockaddr_in *client_address)
+void main_loop(int tun_fd, int server_socket_fd)
 {
     char buffer[MAX_SIZE_BUFF];
-    int client_known = 0;
+
+    struct sockaddr_in client_address;
 
     fd_set readfds;
     int max_fd = (tun_fd > server_socket_fd) ? tun_fd : server_socket_fd;
+
+
 
     while (1)
     {
@@ -159,52 +230,113 @@ void main_loop(int tun_fd, int server_socket_fd,struct sockaddr_in *client_addre
         FD_SET(tun_fd, &readfds);
         FD_SET(server_socket_fd, &readfds);
 
-        if (select(max_fd + 1, &readfds, NULL, NULL, NULL) < 0)
+        /*
+         * Prepare the time out to the select, if it does not receive anything in 15 seconds, it will clean the table
+        */
+        struct timeval timeout;
+        timeout.tv_sec=15;
+        timeout.tv_usec=0;
+        int activity;
+         
+       
+        if ((activity=select(max_fd + 1, &readfds, NULL, NULL, &timeout)) < 0)
         {
             perror("select:");
             continue;
         }
+        if(activity==0)
+        {
+            clean_table();  
+            continue; 
+        }
 
+        /*
+         * if the server socket is set, it means that we have a client trying to send something
+         * we willd read that package from the client and send it to the tun driver
+         * and tun will send it to the kernel, and the kernel will send it to the destination
+        */
         if (FD_ISSET(server_socket_fd, &readfds))
         {
-            int bytes_read, bytes_sent;
-            if ((bytes_read = read_from_client(server_socket_fd, client_address, buffer, MAX_SIZE_BUFF)) < 0)
+            int bytes_read, bytes_sent=0;
+            if ((bytes_read = read_from_client(server_socket_fd, &client_address, buffer, MAX_SIZE_BUFF)) < 0)
             {
                 continue;
             }
-            client_known=1;
-            if ((bytes_sent = send_to_tun(tun_fd, buffer, bytes_read)) < 0)
+
+            vpn_header_t *data_header = (vpn_header_t *)buffer;
+            if (data_header->type == MSG_HANDSHAKE_REQ)
             {
+                int idx=find_client(&client_address);
+                if(idx==-1)
+                {
+                    add_client(&client_address);
+                }
+                if(idx!=-1)
+                {
+                    clients[idx].virtual_ip = data_header->virtual_ip;
+                }
+
+                vpn_header_t ack_header;
+                ack_header.type=MSG_HANDSHAKE_ACK;
+                ack_header.virtual_ip=0;
+                printf("[HANDSHAKE] Cliente ligado com sucesso!\n");
+
+                memcpy(buffer,&ack_header,sizeof(vpn_header_t));
+                send_to_the_client(server_socket_fd, &client_address, buffer, sizeof(vpn_header_t));
                 continue;
+
+            }
+            else if(data_header->type==MSG_DATA)
+            {
+                int data_len=bytes_read-sizeof(vpn_header_t);
+                if(data_len>0)
+                {
+                    if ((bytes_sent = send_to_tun(tun_fd, buffer+sizeof(vpn_header_t), data_len)) < 0)
+                    {
+                        continue;
+                    }
+                }
+
             }
             /* Debug print*/
             printf("[CLIENT -> TUN] %d bytes lidos do cliente %s:%d, %d bytes escritos no TUN\n",
                 bytes_read,
-                inet_ntoa(client_address->sin_addr),
-                ntohs(client_address->sin_port),
+                inet_ntoa(client_address.sin_addr),
+                ntohs(client_address.sin_port),
                 bytes_sent);
         }
+        /*
+         * if the tun_fd is set, it means that we have a package from the kernel, we will read it and send it to the client
+         * we read the package from the tun driver, and we will look for the destination IP in our table, if we find it, we will send it to the client
+        */
         else if (FD_ISSET(tun_fd, &readfds))
         {
-            if (!client_known)
-            {
-                continue;   /* We don't have any client to send */
-            }
             int bytes_read, bytes_sent;
-            if ((bytes_read = read_from_tun(tun_fd, buffer, MAX_SIZE_BUFF)) < 0)
+            if ((bytes_read = read_from_tun(tun_fd, buffer+sizeof(vpn_header_t), MAX_SIZE_BUFF)) < 0)
             {
                 continue;
+            }            
+            struct iphdr *iph = (struct iphdr *)buffer+sizeof(vpn_header_t);
+            uint32_t dest_ip = iph->daddr;      
+            
+            int found = -1;
+            for (int i = 0; i < MAX_CLIENTS; i++) {
+                if (clients[i].known && clients[i].virtual_ip == dest_ip) {
+                    vpn_header_t *header = (vpn_header_t *)buffer;
+                    header->type=MSG_DATA;
+                    header->virtual_ip=clients[i].virtual_ip;
+                    bytes_sent = send_to_the_client(server_socket_fd, &clients[i].client_address, buffer, bytes_read+sizeof(vpn_header_t));
+                    found = i;
+                    break;
+                }
             }
-            if((bytes_sent = send_to_the_client(server_socket_fd, client_address, buffer, bytes_read)) < 0)
-            {
-                continue;
+
+            if (found >= 0 && bytes_sent > 0) {
+                printf("[TUN -> CLIENT] %d bytes lidos do TUN, %d bytes enviados para %s:%d\n",
+                    bytes_read, bytes_sent,
+                    inet_ntoa(clients[found].client_address.sin_addr),
+                    ntohs(clients[found].client_address.sin_port));
             }
-            /* Debug print*/
-            printf("[TUN -> CLIENT] %d bytes lidos do TUN, %d bytes enviados para %s:%d\n",
-                bytes_read,
-                bytes_sent,
-                inet_ntoa(client_address->sin_addr),
-                ntohs(client_address->sin_port));
         }
     }
 }
@@ -218,7 +350,6 @@ int main()
     int tun_fd;
     int server_socket_fd;
     struct sockaddr_in server_address;
-    struct sockaddr_in client_address;
 
     if ((server_socket_fd = create_socket(&server_address)) < 0)
     {
@@ -231,7 +362,7 @@ int main()
     }
 
     /* Main loop*/
-    main_loop(tun_fd,server_socket_fd,&client_address);
+    main_loop(tun_fd,server_socket_fd);
 
     close(server_socket_fd);
     close(tun_fd);

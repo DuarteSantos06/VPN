@@ -19,6 +19,17 @@
 /* includes from my project */
 #include "../../Server/include/server.h"
 
+
+#define MSG_HANDSHAKE_REQ 1
+#define MSG_HANDSHAKE_ACK 2
+#define MSG_DATA 3
+
+typedef struct {
+    uint8_t type;          // Tipo de mensagem (Handshake ou Dados)
+    uint32_t virtual_ip;   // O IP virtual do cliente (útil no handshake)
+    // No futuro podes adicionar aqui: uint32_t seq_number, etc.
+} vpn_header_t;
+
 /*
  * This function allocates a tun file, and connects with an interface, does not receive any parameters 
  * and return -1 in case of an error
@@ -158,6 +169,32 @@ void main_loop(int tun_fd,int client_socket_fd, struct sockaddr_in *server_addre
     char buffer[MAX_SIZE_BUFF];
     fd_set readfds;
     int max_fd = (tun_fd > client_socket_fd) ? tun_fd : client_socket_fd;
+
+    vpn_header_t req_header;
+    req_header.type = MSG_HANDSHAKE_REQ;
+    if (inet_pton(AF_INET, "10.0.0.2", &req_header.virtual_ip) <= 0) {
+        return;
+    }
+    memcpy(buffer, &req_header, sizeof(req_header));
+
+    if (send_to_server(client_socket_fd, server_address, buffer, sizeof(vpn_header_t)) < 0) {
+        return;
+    }
+
+    int bytes_read = read_from_server(client_socket_fd, server_address, buffer, MAX_SIZE_BUFF);
+    if (bytes_read < 0) {
+        return;
+    }
+
+    /*
+     * [5 bytes (vpn_header_t)]
+    */
+    vpn_header_t *resp_header = (vpn_header_t *)buffer;
+    if (resp_header->type != MSG_HANDSHAKE_ACK) {
+        return;
+    }
+    printf("[HANDSHAKE] O Servidor aceitou a ligação! Túnel pronto.\n");
+
     while(1)
     {
         FD_ZERO(&readfds);
@@ -173,11 +210,25 @@ void main_loop(int tun_fd,int client_socket_fd, struct sockaddr_in *server_addre
         if(FD_ISSET(tun_fd,&readfds))
         {
             int bytes_read,bytes_sent;
-            if((bytes_read=read_from_tun(tun_fd,buffer,MAX_SIZE_BUFF))<0)
+            /*
+             * We read from tun, but we put the content sizeof(vpn_header_t) bytes in front of the buffer points so we can write our information
+             * [8 bytes(vpn_header_t) | data ]
+            */
+            if((bytes_read=read_from_tun(tun_fd,buffer+sizeof(vpn_header_t),MAX_SIZE_BUFF))<0)
             {
                 continue;
             }
-            if((bytes_sent=send_to_server(client_socket_fd,server_address,buffer,bytes_read))<0)
+            /*
+             * buffer points to the beginning of the buffer, and we leave space for the vpn_header_t at the start of the buffer
+             * so we can send the type of message and the virtual_ip to the server
+             * The vpn_header_t is placed at the start of the buffer, and the data read from the tun is placed after it
+             * The server will read the vpn_header_t and then read the data from the tun, and send it to the correct client based on the virtual_ip
+            */
+            vpn_header_t *data_header = (vpn_header_t *)buffer;
+            data_header->type = MSG_DATA;
+            data_header->virtual_ip = req_header.virtual_ip;  // Using the predefined virtual IP for this client
+
+            if((bytes_sent=send_to_server(client_socket_fd,server_address,buffer,bytes_read+sizeof(vpn_header_t)))<0)
             {
                 continue;
             }
@@ -190,24 +241,32 @@ void main_loop(int tun_fd,int client_socket_fd, struct sockaddr_in *server_addre
         /* Read from server and send it in the tun */
         else if(FD_ISSET(client_socket_fd,&readfds))
         {
-            int bytes_read, bytes_sent;
+            int bytes_read, bytes_sent=0;
             if((bytes_read=read_from_server(client_socket_fd,server_address,buffer,MAX_SIZE_BUFF))<0)
             {
                 continue;
             }
-            if((bytes_sent=send_to_tun(tun_fd,buffer,bytes_read))<0)
+            vpn_header_t *data_header = (vpn_header_t *)buffer;
+            if(data_header->type==MSG_DATA)
             {
-                continue;
+                int data_len=bytes_read-sizeof(vpn_header_t);
+                if(data_len>0)
+                {
+                    if((bytes_sent=send_to_tun(tun_fd,buffer+sizeof(vpn_header_t),data_len))<0)
+                    {
+                        continue;
+                    }
+                }
+            }
+            else if(data_header->type==MSG_HANDSHAKE_ACK)
+            {
+                printf("[HANDSHAKE] O Servidor aceitou a ligação! Túnel pronto.\n");
             }
             /* debug print */
             printf("[SERVER -> TUN] %d bytes lidos do servidor, %d bytes escritos no TUN\n",
                 bytes_read, bytes_sent);
         }
     }
-
-
-
-
 }
 
 

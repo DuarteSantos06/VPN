@@ -9,6 +9,16 @@ static const unsigned char VPN_KEY[32] = {
     0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00
 };
 
+#define MSG_HANDSHAKE_REQ 1
+#define MSG_HANDSHAKE_ACK 2
+#define MSG_DATA 3
+
+typedef struct {
+    uint8_t type;          // Tipo de mensagem (Handshake ou Dados)
+    uint32_t virtual_ip;   // O IP virtual do cliente (útil no handshake)
+    // No futuro podes adicionar aqui: uint32_t seq_number, etc.
+} vpn_header_t;
+
 // Tamanhos da cifra (baseado na libsodium)
 #define NONCE_LEN 24  // Para XChaCha20
 #define TAG_LEN 16
