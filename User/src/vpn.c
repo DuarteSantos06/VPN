@@ -23,6 +23,8 @@
 #define MSG_HANDSHAKE_REQ 1
 #define MSG_HANDSHAKE_ACK 2
 #define MSG_DATA 3
+#define MSG_CLOSE_CONNECTION 4
+#define MSG_KEEP_ALIVE 5
 
 typedef struct {
     uint8_t type;          // Tipo de mensagem (Handshake ou Dados)
@@ -201,9 +203,25 @@ void main_loop(int tun_fd,int client_socket_fd, struct sockaddr_in *server_addre
         FD_SET(tun_fd, &readfds);
         FD_SET(client_socket_fd, &readfds);
 
-        if(select(max_fd + 1, &readfds, NULL, NULL, NULL) < 0) {
+        struct timeval timeout;
+        timeout.tv_sec = 10;  // 5 seconds timeout
+        timeout.tv_usec = 0;
+        int activity;
+
+        if((activity=select(max_fd + 1, &readfds, NULL, NULL, NULL) < 0)) {
             perror("select:");
             continue;
+        }
+        /*
+         * Keep alive logic
+        */
+        if(activity==0)
+        {
+            vpn_header_t keep_alive_header;
+            keep_alive_header.type=MSG_KEEP_ALIVE;
+            keep_alive_header.virtual_ip=req_header.virtual_ip;
+            memcpy(buffer,&keep_alive_header,sizeof(vpn_header_t));
+            send_to_server(client_socket_fd,server_address,buffer,sizeof(vpn_header_t));
         }
 
         /* Read from the tun, and then send it to the server*/
@@ -267,6 +285,12 @@ void main_loop(int tun_fd,int client_socket_fd, struct sockaddr_in *server_addre
                 bytes_read, bytes_sent);
         }
     }
+
+    vpn_header_t close_header;
+    close_header.type = MSG_CLOSE_CONNECTION;
+    close_header.virtual_ip = req_header.virtual_ip;
+    memcpy(buffer, &close_header, sizeof(close_header));
+    send_to_server(client_socket_fd, server_address, buffer, sizeof(vpn_header_t));
 }
 
 

@@ -19,6 +19,8 @@
 #define MSG_HANDSHAKE_REQ 1
 #define MSG_HANDSHAKE_ACK 2
 #define MSG_DATA 3
+#define MSG_CLOSE_CONNECTION 4
+#define MSG_KEEP_ALIVE 5
 
 typedef struct {
     uint8_t type;          // Tipo de mensagem (Handshake ou Dados)
@@ -54,8 +56,9 @@ int add_client(struct sockaddr_in *client_address)
     {
         if( clients[i].known==0)
         {
-            memset(&clients[i], 0, sizeof(client_table));
+            memset(&clients[i], 0, sizeof(struct client_table));
             clients[i].client_address = *client_address;
+            clients[i].virtual_ip = virtual_ip;
             clients[i].known = 1;
             clients[i].last_seen = time(NULL);
             return i;
@@ -207,6 +210,31 @@ int send_to_the_client(int server_socket_fd, struct sockaddr_in *client_address,
     return bytes_sent;
 }
 
+/*
+ * this function is responsible for the hanshake with the client
+*/
+void hanshake_with_client(struct sockaddr_in *client_address,int server_socket_fd,char *buffer,vpn_header_t *data_header)
+{
+    int idx=find_client(client_address);
+    if(idx==-1)
+    {
+        add_client(client_address);
+    }
+    if(idx!=-1)
+    {
+        clients[idx].virtual_ip = data_header->virtual_ip;
+    }
+
+    vpn_header_t ack_header;
+    ack_header.type=MSG_HANDSHAKE_ACK;
+    ack_header.virtual_ip=0;
+    printf("[HANDSHAKE] Cliente ligado com sucesso!\n");
+    char ack_buffer[sizeof(vpn_header_t)];
+
+    memcpy(ack_buffer,&ack_header,sizeof(vpn_header_t));
+    send_to_the_client(server_socket_fd, client_address, buffer, sizeof(vpn_header_t));
+}
+
 
 /*
  * Main loop function, handles the select and the read/write from tun and server
@@ -221,7 +249,7 @@ void main_loop(int tun_fd, int server_socket_fd)
 
     fd_set readfds;
     int max_fd = (tun_fd > server_socket_fd) ? tun_fd : server_socket_fd;
-
+    time_t last_clean_time = time(NULL);
 
 
     while (1)
@@ -230,24 +258,16 @@ void main_loop(int tun_fd, int server_socket_fd)
         FD_SET(tun_fd, &readfds);
         FD_SET(server_socket_fd, &readfds);
 
-        /*
-         * Prepare the time out to the select, if it does not receive anything in 15 seconds, it will clean the table
-        */
-        struct timeval timeout;
-        timeout.tv_sec=15;
-        timeout.tv_usec=0;
-        int activity;
-         
        
-        if ((activity=select(max_fd + 1, &readfds, NULL, NULL, &timeout)) < 0)
+        if (select(max_fd + 1, &readfds, NULL, NULL, NULL) < 0)
         {
             perror("select:");
             continue;
         }
-        if(activity==0)
+        if(time(NULL) - last_clean_time >= 5)
         {
-            clean_table();  
-            continue; 
+            clean_table();
+            last_clean_time = time(NULL);
         }
 
         /*
@@ -266,23 +286,7 @@ void main_loop(int tun_fd, int server_socket_fd)
             vpn_header_t *data_header = (vpn_header_t *)buffer;
             if (data_header->type == MSG_HANDSHAKE_REQ)
             {
-                int idx=find_client(&client_address);
-                if(idx==-1)
-                {
-                    add_client(&client_address);
-                }
-                if(idx!=-1)
-                {
-                    clients[idx].virtual_ip = data_header->virtual_ip;
-                }
-
-                vpn_header_t ack_header;
-                ack_header.type=MSG_HANDSHAKE_ACK;
-                ack_header.virtual_ip=0;
-                printf("[HANDSHAKE] Cliente ligado com sucesso!\n");
-
-                memcpy(buffer,&ack_header,sizeof(vpn_header_t));
-                send_to_the_client(server_socket_fd, &client_address, buffer, sizeof(vpn_header_t));
+                hanshake_with_client(&client_address,server_socket_fd,buffer,data_header);
                 continue;
 
             }
@@ -296,7 +300,26 @@ void main_loop(int tun_fd, int server_socket_fd)
                         continue;
                     }
                 }
-
+            }else if(data_header->type==MSG_CLOSE_CONNECTION)
+            {
+                int idx = find_client(&client_address);
+                if (idx != -1)
+                {
+                    memset(&clients[idx], 0, sizeof(struct client_table));
+                }
+            }
+            else if (data_header->type==MSG_KEEP_ALIVE)
+            {
+                int idx=find_client(&client_address);
+                if(idx!=-1)
+                {
+                    clients[idx].last_seen = time(NULL);
+                }
+                vpn_header_t keep_alive_ack;
+                keep_alive_ack.type=MSG_KEEP_ALIVE;
+                keep_alive_ack.virtual_ip=0;
+                memcpy(buffer,&keep_alive_ack,sizeof(vpn_header_t));
+                send_to_the_client(server_socket_fd,&client_address,buffer,sizeof(vpn_header_t));
             }
             /* Debug print*/
             printf("[CLIENT -> TUN] %d bytes lidos do cliente %s:%d, %d bytes escritos no TUN\n",
@@ -312,7 +335,7 @@ void main_loop(int tun_fd, int server_socket_fd)
         else if (FD_ISSET(tun_fd, &readfds))
         {
             int bytes_read, bytes_sent;
-            if ((bytes_read = read_from_tun(tun_fd, buffer+sizeof(vpn_header_t), MAX_SIZE_BUFF)) < 0)
+            if ((bytes_read = read_from_tun(tun_fd, buffer+sizeof(vpn_header_t), MAX_SIZE_BUFF-sizeof(vpn_header_t))) < 0)
             {
                 continue;
             }            
